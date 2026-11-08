@@ -99,6 +99,11 @@ class Synchronizer {
 
         var hasAccess = true
         var haConfig = ""
+        var publishedCount = 0
+        // Set only by a path that actually opened the Find My cache. The
+        // heartbeat is withheld otherwise, so a missing beacon key or both
+        // sources switched off reads as stale in Home Assistant, as it should.
+        var readFindMy = false
 
         if #available(macOS 14.4, *) {
             func getKeyData(from hexString: String) -> Data {
@@ -373,6 +378,7 @@ class Synchronizer {
                     }
 
                     log("Scanned \(beacons.count) records")
+                    readFindMy = true
 
                     for (identifier, beacon) in beacons {
                         print(identifier, beacon)
@@ -384,8 +390,10 @@ class Synchronizer {
                                 beacon.longitude,
                             accuracy: beacon.accuracy,
                             battery: -1,
-                            address: ""
+                            address: "",
+                            timestamp: beacon.timestamp
                         )
+                        publishedCount += 1
 
                         if generate_config {
                             haConfig += "device_tracker.\(MQTTPublisher.entityId(for: identifier))  # \(beacon.name)\n"
@@ -427,6 +435,7 @@ class Synchronizer {
                         with: data, options: .mutableLeaves)
                     if let jsonResult = jsonResult as? [AnyObject] {
                         log("Got " + String(jsonResult.count) + " item(s):")
+                        readFindMy = true
                         for item in jsonResult {
                             if let id = item["identifier"] as? String {
                                 let name = item["name"] as! String
@@ -514,8 +523,10 @@ class Synchronizer {
                                                 longitude,
                                             accuracy: accuracy,
                                             battery: -1,
-                                            address: fullAddress
+                                            address: fullAddress,
+                                            timestamp: Synchronizer.fixTime(from: location)
                                         )
+                                        publishedCount += 1
 
                                         if generate_config {
                                             haConfig += "device_tracker.\(MQTTPublisher.entityId(for: id))  # \(name)\n"
@@ -549,6 +560,7 @@ class Synchronizer {
                         with: data, options: .mutableLeaves)
                     if let jsonResult = jsonResult as? [AnyObject] {
                         log("Got " + String(jsonResult.count) + " item(s):")
+                        readFindMy = true
                         for item in jsonResult {
                             if let id = item["baUUID"] as? String {
                                 let name = item["name"] as! String
@@ -653,8 +665,10 @@ class Synchronizer {
                                             accuracy: accuracy,
                                             battery:
                                                 batteryLevel,
-                                            address: fullAddress
+                                            address: fullAddress,
+                                            timestamp: Synchronizer.fixTime(from: location)
                                         )
+                                        publishedCount += 1
 
                                         if generate_config {
                                             haConfig += "device_tracker.\(MQTTPublisher.entityId(for: id))  # \(name)\n"
@@ -689,6 +703,12 @@ class Synchronizer {
             if generate_config {
                 logConfig(haConfig)
             }
+            // Heartbeat only after a pass that actually read Find My. A pass
+            // that could not read the cache publishes nothing, so the
+            // `sensor.findmy_last_sync` timestamp goes stale — which is the point.
+            if readFindMy {
+                MQTTPublisher.shared.finish(deviceCount: publishedCount)
+            }
         }
 
         // Clamped read, so a stray value written by hand or over MQTT cannot
@@ -709,7 +729,7 @@ class Synchronizer {
 
     func updateEntity(
         id: String, name: String, latitude: NSNumber, longitude: NSNumber, accuracy: NSNumber,
-        battery: NSNumber, address: String
+        battery: NSNumber, address: String, timestamp: Date? = nil
     ) {
         MQTTPublisher.shared.publish(
             identifier: id,
@@ -718,7 +738,22 @@ class Synchronizer {
             longitude: longitude,
             accuracy: accuracy,
             battery: battery,
-            address: address
+            address: address,
+            timestamp: timestamp
         )
+    }
+
+    /// Find My's cache files carry the fix time as `timeStamp`, milliseconds
+    /// since the epoch. Older dumps have been seen with seconds and with the
+    /// key in lower case, so accept both; anything unparseable is `nil` and the
+    /// attribute is simply omitted.
+    static func fixTime(from location: [String: Any]) -> Date? {
+        let raw = location["timeStamp"] ?? location["timestamp"]
+        if let date = raw as? Date { return date }
+        guard let number = raw as? NSNumber else { return nil }
+        let value = number.doubleValue
+        guard value > 0 else { return nil }
+        // Anything past the year 2100 in seconds is milliseconds.
+        return Date(timeIntervalSince1970: value > 4_102_444_800 ? value / 1000 : value)
     }
 }

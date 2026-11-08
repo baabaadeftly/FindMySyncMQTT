@@ -58,6 +58,24 @@ final class MQTTPublisher {
     private var connectionSignature = ""
     private var delegateShim: DelegateShim?
 
+    /// Consecutive sync passes that ended without a connected client. Once it
+    /// reaches `rebuildAfterFailedPasses` the client is thrown away and rebuilt,
+    /// because CocoaMQTT's auto-reconnect has been seen to stall for days in
+    /// `.connecting` after the broker became unreachable, and never recover once
+    /// it was reachable again. A fresh socket does recover.
+    private var failedPasses = 0
+    private static let rebuildAfterFailedPasses = 2
+
+    /// TCP connect timeout. The default `connect()` has none and leaves the
+    /// socket waiting on the OS, which is where the stall above began.
+    private static let connectTimeout: TimeInterval = 10
+
+    private static let iso8601: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
     /// entity ID -> the name last announced for it. Discovery is republished
     /// only when a device is new or has been renamed in Find My.
     private var announced = [String: String]()
@@ -117,6 +135,10 @@ final class MQTTPublisher {
             "\(topicPrefix)/sync/set"
         }
 
+        var lastSyncTopic: String {
+            "\(topicPrefix)/status/last_sync"
+        }
+
         func attributesTopic(_ entityId: String) -> String {
             "\(topicPrefix)/\(entityId)/attributes"
         }
@@ -170,22 +192,47 @@ final class MQTTPublisher {
             }
 
             if self.ensureConnected(settings) {
+                self.failedPasses = 0
                 self.log("MQTT: connected to \(settings.host):\(settings.port)")
                 if settings.publishAvailability {
                     self.send(topic: settings.statusTopic, payload: "online")
                 }
                 self.announceControlsIfNeeded(settings)
             } else {
+                self.failedPasses += 1
+                let state = self.client.map { "\($0.connState)" } ?? "no client"
                 self.log(
-                    "MQTT: \(settings.host):\(settings.port) not reachable yet — "
-                        + "messages are queued and flush on connect")
+                    "MQTT: \(settings.host):\(settings.port) not reachable "
+                        + "(state \(state), \(self.failedPasses) failed pass"
+                        + (self.failedPasses == 1 ? "" : "es")
+                        + ") — messages are queued and flush on connect")
             }
+        }
+    }
+
+    /// Called once at the end of every sync pass that read Find My successfully.
+    /// Publishes the heartbeat Home Assistant uses to tell a live feed from a
+    /// retained replay: the topic is retained like everything else, but a
+    /// replay carries the *old* `last_sync`, so a sensor keyed on it stays stale
+    /// through a Home Assistant restart while the app is not publishing.
+    func finish(deviceCount: Int) {
+        queue.async {
+            let settings = self.loadSettings()
+            guard !settings.host.isEmpty else { return }
+
+            let payload: [String: Any] = [
+                "last_sync": MQTTPublisher.iso8601.string(from: Date()),
+                "device_count": deviceCount,
+            ]
+            guard let json = MQTTPublisher.json(payload) else { return }
+            self.send(topic: settings.lastSyncTopic, payload: json)
+            self.log("MQTT: heartbeat published (\(deviceCount) devices)")
         }
     }
 
     func publish(
         identifier: String, name: String, latitude: NSNumber, longitude: NSNumber,
-        accuracy: NSNumber, battery: NSNumber, address: String
+        accuracy: NSNumber, battery: NSNumber, address: String, timestamp: Date? = nil
     ) {
         queue.async {
             let settings = self.loadSettings()
@@ -215,6 +262,18 @@ final class MQTTPublisher {
             // Find My reports battery as a 0–1 fraction, and -1 when unknown.
             if battery.doubleValue > 0 {
                 attributes["battery_level"] = Int((battery.doubleValue * 100).rounded())
+            }
+
+            // Find My's own fix time for the device, ISO 8601 UTC. It only
+            // advances when Find My has a new fix, so it costs no extra recorder
+            // writes on a stationary device, and it does not advance while Find
+            // My itself is stale (window minimised, signed out) — which the
+            // coordinates alone cannot show. The per-pass heartbeat lives on a
+            // separate topic (see `finish`), deliberately not here: a timestamp
+            // that changes every pass on every device would force a recorder
+            // write per device per poll, the same cost that got `address` removed.
+            if let timestamp = timestamp {
+                attributes["last_seen"] = MQTTPublisher.iso8601.string(from: timestamp)
             }
 
             guard let payload = MQTTPublisher.json(attributes) else {
@@ -311,6 +370,21 @@ final class MQTTPublisher {
             "device": device,
         ]
 
+        // No availability on this one on purpose: its whole job is to keep
+        // reporting the old timestamp when the app is gone.
+        let lastSync: [String: Any] = [
+            "name": "Last sync",
+            "unique_id": "findmysync_last_sync",
+            "default_entity_id": "sensor.findmy_last_sync",
+            "state_topic": settings.lastSyncTopic,
+            "value_template": "{{ value_json.last_sync }}",
+            "json_attributes_topic": settings.lastSyncTopic,
+            "device_class": "timestamp",
+            "icon": "mdi:clock-check-outline",
+            "entity_category": "diagnostic",
+            "device": device,
+        ]
+
         if settings.publishAvailability {
             number["availability_topic"] = settings.statusTopic
             number["payload_available"] = "online"
@@ -318,6 +392,13 @@ final class MQTTPublisher {
             button["availability_topic"] = settings.statusTopic
             button["payload_available"] = "online"
             button["payload_not_available"] = "offline"
+        }
+
+        if let payload = MQTTPublisher.json(lastSync) {
+            send(
+                topic: settings.controlDiscoveryTopic(
+                    component: "sensor", objectId: "findmysync_last_sync"),
+                payload: payload)
         }
 
         if let payload = MQTTPublisher.json(number) {
@@ -339,7 +420,7 @@ final class MQTTPublisher {
             payload: String(MQTTPublisher.currentInterval()))
 
         controlsAnnounced = true
-        log("MQTT: control entities published (update interval, sync now)")
+        log("MQTT: control entities published (update interval, sync now, last sync)")
     }
 
     private func subscribeToCommands(_ settings: Settings) {
@@ -434,13 +515,30 @@ final class MQTTPublisher {
             return true
         }
 
-        // Settings changed: tear the old connection down and re-announce everything.
-        if connectionSignature != settings.signature, let existing = client {
+        // Tear the connection down and re-announce everything when the settings
+        // changed, or when the existing client has failed to connect for
+        // `rebuildAfterFailedPasses` passes in a row. The second case is the
+        // one that matters: a client that has gone through the broker being
+        // unreachable can stay in `.connecting` indefinitely, with
+        // autoReconnect no longer firing, and `connect()` on it is a no-op.
+        // Observed 6–8 Nov 2026: two days of "not reachable" against a broker
+        // that was reachable again, cured only by relaunching the app.
+        let settingsChanged = connectionSignature != settings.signature
+        let stuck = failedPasses >= MQTTPublisher.rebuildAfterFailedPasses
+        if settingsChanged || stuck, let existing = client {
+            if stuck {
+                log("MQTT: connection stuck in \(existing.connState) — rebuilding the client")
+            }
+            // Stop the old client's own retry timer first; otherwise it can
+            // reconnect later with the same clientID and bounce the new one.
+            existing.autoReconnect = false
+            existing.delegate = nil
             existing.disconnect()
             client = nil
             delegateShim = nil
             announced.removeAll()
             controlsAnnounced = false
+            failedPasses = 0
         }
 
         if client == nil {
@@ -457,6 +555,10 @@ final class MQTTPublisher {
             mqtt.keepAlive = 60
             mqtt.cleanSession = true
             mqtt.autoReconnect = true
+            // Default is 128 s of exponential backoff; with a sync pass every
+            // 1–60 min the rebuild above is the real recovery path, so cap the
+            // library's own retry at something that still beats the next pass.
+            mqtt.maxAutoReconnectTimeInterval = 30
 
             if settings.publishAvailability {
                 let will = CocoaMQTTMessage(topic: settings.statusTopic, string: "offline")
@@ -471,9 +573,12 @@ final class MQTTPublisher {
 
             client = mqtt
             connectionSignature = settings.signature
-            _ = mqtt.connect()
-        } else if client?.connState != .connected {
-            _ = client?.connect()
+            _ = mqtt.connect(timeout: MQTTPublisher.connectTimeout)
+        } else if let existing = client, existing.connState == .disconnected {
+            // Only kick a client that is actually idle. Calling connect() on one
+            // that is mid-handshake throws inside the socket layer and leaves it
+            // where it was; the failed-pass counter deals with that case.
+            _ = existing.connect(timeout: MQTTPublisher.connectTimeout)
         }
 
         // Bounded wait. This runs on our own serial queue, never the main thread.
@@ -527,6 +632,8 @@ private final class DelegateShim: NSObject, CocoaMQTTDelegate {
     func mqttDidDisconnect(_ mqtt: CocoaMQTT, withError err: Error?) {
         if let err = err {
             owner.log("MQTT: disconnected — \(err.localizedDescription)")
+        } else {
+            owner.log("MQTT: disconnected")
         }
     }
 
